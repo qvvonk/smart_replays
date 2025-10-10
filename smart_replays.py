@@ -242,6 +242,7 @@ class ClipNamingModes(Enum):
     CURRENT_PROCESS = 0
     MOST_RECORDED_PROCESS = 1
     CURRENT_SCENE = 2
+    PROCESS_DESCRIPTION = 3
 
 
 class VideoNamingModes(Enum):
@@ -328,6 +329,7 @@ class PropertiesNames:
     HK_SAVE_BUFFER_MODE_1 = "save_buffer_force_mode_1"
     HK_SAVE_BUFFER_MODE_2 = "save_buffer_force_mode_2"
     HK_SAVE_BUFFER_MODE_3 = "save_buffer_force_mode_3"
+    HK_SAVE_BUFFER_MODE_4 = "save_buffer_force_mode_4"
     HK_SAVE_VIDEO_MODE_1 = "save_video_force_mode_1"
     HK_SAVE_VIDEO_MODE_2 = "save_video_force_mode_2"
     HK_SAVE_VIDEO_MODE_3 = "save_video_force_mode_3"
@@ -501,6 +503,11 @@ def setup_clip_paths_settings(group_obj):
         p=clip_naming_mode_prop,
         name="the name of the current scene;",
         val=ClipNamingModes.CURRENT_SCENE.value
+    )
+    obs.obs_property_list_add_int(
+        p=clip_naming_mode_prop,
+        name="the program name as shown in Task Manager (cleaned of special characters);",
+        val=ClipNamingModes.PROCESS_DESCRIPTION.value
     )
 
     t = obs.obs_properties_add_text(
@@ -1101,6 +1108,69 @@ def get_active_window_pid() -> int | None:
     return pid.value
 
 
+def get_process_description(executable_path: Path) -> str:
+    """
+    Gets the process description from the executable's file version info.
+    Falls back to the executable name if no description is available.
+    
+    :param executable_path: Path to the executable file
+    :return: Process description or executable name
+    """
+    try:
+        print("Using win32api to get process description.")
+        import win32api
+        try:
+            info = win32api.GetFileVersionInfo(str(executable_path), "\\")
+            ms = info['FileVersionMS']
+            ls = info['FileVersionLS']
+            
+            lang, codepage = win32api.VerQueryValue(info, '\\VarFileInfo\\Translation')[0]
+            string_file_info = f'\\StringFileInfo\\{lang:04x}{codepage:04x}\\'
+            
+            description = win32api.VerQueryValue(info, string_file_info + 'FileDescription')
+            if description and description.strip():
+                return description.strip()
+                
+        except (ImportError, Exception):
+            print("Failed to get process description using win32api, falling back to ctypes method.")
+            pass
+            
+    except Exception:
+        print("Failed to import win32api, falling back to ctypes method.")
+        pass
+    
+    # Fallback: try using ctypes method
+    try:
+        print("Using ctypes to get process description.")
+        import ctypes
+        from ctypes import wintypes
+        
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(str(executable_path), None)
+        if size == 0:
+            return executable_path.stem
+            
+        buffer = ctypes.create_string_buffer(size)
+        ctypes.windll.version.GetFileVersionInfoW(str(executable_path), 0, size, buffer)
+        
+        value = ctypes.c_void_p()
+        value_size = wintypes.UINT()
+        
+        if ctypes.windll.version.VerQueryValueW(
+            buffer, 
+            "\\StringFileInfo\\040904b0\\FileDescription",
+            ctypes.byref(value), 
+            ctypes.byref(value_size)
+        ):
+            description = ctypes.wstring_at(value, value_size.value - 1)
+            if description and description.strip():
+                return description.strip()
+    except Exception:
+        print("Failed to get process description using ctypes, falling back to executable name.")
+        pass
+    
+    return executable_path.stem
+
+
 def get_executable_path(pid: int) -> Path:
     """
     Gets path of process's executable.
@@ -1354,7 +1424,23 @@ def gen_clip_base_name(mode: ClipNamingModes | None = None) -> str:
     mode = obs.obs_data_get_int(VARIABLES.script_settings, PN.PROP_CLIPS_NAMING_MODE) if mode is None else mode
     mode = ClipNamingModes(mode)
 
-    if mode in [ClipNamingModes.CURRENT_PROCESS, ClipNamingModes.MOST_RECORDED_PROCESS]:
+    if mode == ClipNamingModes.PROCESS_DESCRIPTION:
+        _print("Clip file name depends on the process description (Task Manager name).")
+        pid = get_active_window_pid()
+        executable_path = get_executable_path(pid)
+        description = get_process_description(executable_path)
+        
+        # Clean the description of prohibited characters
+        for char in CONSTANTS.FILENAME_PROHIBITED_CHARS:
+            description = description.replace(char, '')
+        
+        # Replace multiple spaces with single space and strip
+        description = ' '.join(description.split())
+        
+        _print(f"Process description (cleaned): {description}")
+        return description if description else executable_path.stem
+
+    elif mode in [ClipNamingModes.CURRENT_PROCESS, ClipNamingModes.MOST_RECORDED_PROCESS]:
         if mode is ClipNamingModes.CURRENT_PROCESS:
             _print("Clip file name depends on the name of an active app (.exe file name) at the moment of clip saving.")
             pid = get_active_window_pid()
@@ -1640,7 +1726,10 @@ def load_hotkeys():
          lambda pressed: save_buffer_with_force_mode(ClipNamingModes.MOST_RECORDED_PROCESS) if pressed else None),
 
         (PN.HK_SAVE_BUFFER_MODE_3, "[Smart Replays] Save buffer (active scene)",
-         lambda pressed: save_buffer_with_force_mode(ClipNamingModes.CURRENT_SCENE) if pressed else None)
+         lambda pressed: save_buffer_with_force_mode(ClipNamingModes.CURRENT_SCENE) if pressed else None),
+
+        (PN.HK_SAVE_BUFFER_MODE_4, "[Smart Replays] Save buffer (program description)",
+         lambda pressed: save_buffer_with_force_mode(ClipNamingModes.PROCESS_DESCRIPTION) if pressed else None)
     )
 
     for key_name, key_desc, key_callback in keys:
